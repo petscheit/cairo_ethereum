@@ -1,18 +1,26 @@
+use crate::constants::{SLOTS_PER_EPOCH, TARGET_BATCH_SIZE};
 use crate::epoch_update::{EpochUpdate, ExpectedEpochUpdateOutputs};
+use crate::helpers::{
+    calculate_slots_range_for_batch, get_first_slot_for_epoch, get_sync_committee_id_by_epoch,
+    slot_to_epoch_id,
+};
 use crate::traits::{Provable, Submittable};
 use crate::utils::hashing::get_committee_hash;
+
 use crate::utils::merkle::poseidon::{compute_paths, compute_root, hash_path};
 use crate::{BankaiClient, Error};
 use alloy_primitives::FixedBytes;
 use hex;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use starknet::macros::selector;
 use starknet_crypto::Felt;
 use std::fs;
 
-const TARGET_BATCH_SIZE: u64 = 32;
-const SLOTS_PER_EPOCH: u64 = 32;
+use crate::utils::database_manager::DatabaseManager;
+use std::sync::Arc;
+use tracing::{debug, info};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EpochUpdateBatch {
@@ -34,32 +42,45 @@ pub struct ExpectedEpochBatchOutputs {
 }
 
 impl EpochUpdateBatch {
+    #[cfg(feature = "cli")]
     pub(crate) async fn new(bankai: &BankaiClient) -> Result<EpochUpdateBatch, Error> {
         let (start_slot, mut end_slot) = bankai
             .starknet_client
             .get_batching_range(&bankai.config)
             .await?;
-        println!("Slots in Term: Start {}, End {}", start_slot, end_slot);
+        info!("Slots in Term: Start {}, End {}", start_slot, end_slot);
         let epoch_gap = (end_slot - start_slot) / SLOTS_PER_EPOCH;
-        println!("Available Epochs: {}", epoch_gap);
+        info!(
+            "Available Epochs in this Sync Committee period: {}",
+            epoch_gap
+        );
 
         // if the gap is smaller then x2 the target size, use the entire gap
         if epoch_gap >= TARGET_BATCH_SIZE * 2 {
             end_slot = start_slot + TARGET_BATCH_SIZE * SLOTS_PER_EPOCH;
         }
 
-        println!("Selected Slots: Start {}, End {}", start_slot, end_slot);
-        println!("Epoch Count: {}", (end_slot - start_slot) / SLOTS_PER_EPOCH);
+        info!("Selected Slots: Start {}, End {}", start_slot, end_slot);
+        info!("Epoch Count: {}", (end_slot - start_slot) / SLOTS_PER_EPOCH);
 
         let mut epochs = vec![];
 
         // Fetch epochs sequentially from start_slot to end_slot, incrementing by 32 each time
         let mut current_slot = start_slot;
-        while current_slot <= end_slot {
+        while current_slot < end_slot {
+            // Current slot is the starting slot of epoch
+            info!(
+                "Getting data for slot: {} Epoch: {} Epochs batch position {}/{}",
+                current_slot,
+                slot_to_epoch_id(current_slot),
+                epochs.len(),
+                TARGET_BATCH_SIZE
+            );
             let epoch_update = EpochUpdate::new(&bankai.client, current_slot).await?;
 
             epochs.push(epoch_update);
             current_slot += 32;
+            //info!("epochspush");
         }
 
         let circuit_inputs = EpochUpdateBatchInputs {
@@ -92,6 +113,200 @@ impl EpochUpdateBatch {
         };
 
         Ok(batch)
+    }
+
+    // pub(crate) async fn new_by_slot(
+    //     bankai: &BankaiClient,
+    //     db_manager: Arc<DatabaseManager>,
+    //     slot: u64,
+    // ) -> Result<EpochUpdateBatch, Error> {
+    //     let _permit = bankai
+    //         .config
+    //         .epoch_data_fetching_semaphore
+    //         .clone()
+    //         .acquire_owned()
+    //         .await
+    //         .map_err(|e| Error::CairoRunError(format!("Semaphore error: {}", e)))?;
+
+    //     let (start_slot, end_slot) = calculate_slots_range_for_batch(slot);
+    //     let mut epochs = vec![];
+
+    //     // Fetch epochs sequentially from start_slot to end_slot, incrementing by 32 each time
+    //     let mut current_slot = start_slot;
+    //     while current_slot < end_slot {
+    //         info!(
+    //             "Getting data for slot: {} Epoch: {} Epochs batch position {}/{}",
+    //             current_slot,
+    //             slot_to_epoch_id(current_slot),
+    //             epochs.len(),
+    //             TARGET_BATCH_SIZE
+    //         );
+    //         let epoch_update = EpochUpdate::new(&bankai.client, current_slot).await?;
+
+    //         epochs.push(epoch_update);
+    //         current_slot += 32;
+    //     }
+
+    //     let circuit_inputs = EpochUpdateBatchInputs {
+    //         committee_hash: get_committee_hash(epochs[0].circuit_inputs.aggregate_pub.0),
+    //         epochs,
+    //     };
+
+    //     let expected_circuit_outputs = ExpectedEpochBatchOutputs::from_inputs(&circuit_inputs);
+
+    //     let epoch_hashes = circuit_inputs
+    //         .epochs
+    //         .iter()
+    //         .map(|epoch| epoch.expected_circuit_outputs.hash())
+    //         .collect::<Vec<Felt>>();
+
+    //     let (root, paths) = compute_paths(epoch_hashes.clone());
+
+    //     // Verify each path matches the root
+    //     current_slot = start_slot;
+    //     for (index, path) in paths.iter().enumerate() {
+    //         let computed_root = hash_path(epoch_hashes[index], path, index);
+    //         if computed_root != root {
+    //             panic!("Path {} does not match root", index);
+    //         }
+    //         // Insert merkle paths to database
+    //         let current_epoch = slot_to_epoch_id(current_slot);
+    //         for (path_index, current_path) in path.iter().enumerate() {
+    //             db_manager
+    //                 .insert_merkle_path_for_epoch(
+    //                     current_epoch,
+    //                     path_index.to_u64().unwrap(),
+    //                     current_path.to_hex_string(),
+    //                 )
+    //                 .await
+    //                 .map_err(|e| Error::DatabaseError(e.to_string()))?;
+    //         }
+    //         current_slot += 32;
+    //     }
+
+    //     info!("Paths {:?}", paths);
+
+    //     let batch = EpochUpdateBatch {
+    //         circuit_inputs,
+    //         expected_circuit_outputs,
+    //         merkle_paths: paths,
+    //     };
+
+    //     Ok(batch)
+    // }
+
+    pub(crate) async fn new_by_epoch_range(
+        bankai: &BankaiClient,
+        db_manager: Arc<DatabaseManager>,
+        start_epoch: u64,
+        end_epoch: u64,
+    ) -> Result<EpochUpdateBatch, Error> {
+        let _permit = bankai
+            .config
+            .epoch_data_fetching_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::CairoRunError(format!("Semaphore error: {}", e)))?;
+
+        let mut epochs = vec![];
+
+        // Fetch epochs sequentially from start_slot to end_slot, incrementing by 32 each time
+        let calculated_batch_size = end_epoch - start_epoch;
+        let mut current_epoch = start_epoch;
+        while current_epoch <= end_epoch {
+            info!(
+                "Getting data for Epoch: {} (SyncCommittee: {}) First slot for this epoch: {} | Epochs batch position {}/{}",
+                current_epoch,
+                get_sync_committee_id_by_epoch(current_epoch),
+                get_first_slot_for_epoch(current_epoch),
+                epochs.len()+1,
+                calculated_batch_size
+            );
+            let epoch_update =
+                EpochUpdate::new(&bankai.client, get_first_slot_for_epoch(current_epoch)).await?;
+
+            epochs.push(epoch_update);
+            current_epoch += 1;
+        }
+
+        let circuit_inputs = EpochUpdateBatchInputs {
+            committee_hash: get_committee_hash(epochs[0].circuit_inputs.aggregate_pub.0),
+            epochs,
+        };
+
+        let expected_circuit_outputs = ExpectedEpochBatchOutputs::from_inputs(&circuit_inputs);
+
+        let epoch_hashes = circuit_inputs
+            .epochs
+            .iter()
+            .map(|epoch| epoch.expected_circuit_outputs.hash())
+            .collect::<Vec<Felt>>();
+
+        let (root, paths) = compute_paths(epoch_hashes.clone());
+
+        // Verify each path matches the root
+        current_epoch = start_epoch;
+        for (index, path) in paths.iter().enumerate() {
+            let computed_root = hash_path(epoch_hashes[index], path, index);
+            if computed_root != root {
+                panic!("Path {} does not match root", index);
+            }
+            // Insert merkle paths to database
+            //let current_epoch = slot_to_epoch_id(current_slot);
+            for (path_index, current_path) in path.iter().enumerate() {
+                db_manager
+                    .insert_merkle_path_for_epoch(
+                        current_epoch,
+                        path_index.to_u64().unwrap(),
+                        current_path.to_hex_string(),
+                    )
+                    .await
+                    .map_err(|e| Error::DatabaseError(e.to_string()))?;
+            }
+            current_epoch += 1;
+        }
+
+        info!("Paths {:?}", paths);
+
+        let batch = EpochUpdateBatch {
+            circuit_inputs,
+            expected_circuit_outputs,
+            merkle_paths: paths,
+        };
+
+        Ok(batch)
+    }
+}
+
+impl EpochUpdateBatch {
+    pub fn from_json<T>(first_slot: u64, last_slot: u64) -> Result<T, Error>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        info!(
+            "Trying to read file batches/epoch_batch/{}_to_{}/input_batch_{}_to_{}.json",
+            first_slot, last_slot, first_slot, last_slot
+        );
+        // Pattern match for files like: batches/epoch_batch/6709248_to_6710272/input_batch_6709248_to_6710272.json
+        let path = format!(
+            "batches/epoch_batch/{}_to_{}/input_batch_{}_to_{}.json",
+            first_slot, last_slot, first_slot, last_slot
+        );
+        debug!(path);
+        let glob_pattern = glob::glob(&path)
+            .map_err(|e| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Take the first matching file
+        let path = glob_pattern.take(1).next().ok_or_else(|| {
+            Error::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No matching file found",
+            ))
+        })?;
+
+        let json = fs::read_to_string(path.unwrap()).map_err(Error::IoError)?;
+        serde_json::from_str(&json).map_err(|e| Error::DeserializeError(e.to_string()))
     }
 }
 
@@ -129,30 +344,6 @@ impl Provable for EpochUpdateBatch {
         );
         fs::write(path.clone(), json).map_err(Error::IoError)?;
         Ok(path)
-    }
-
-    fn from_json<T>(slot: u64) -> Result<T, Error>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        // Pattern match for files like: batches/epoch_batch/6709248_to_6710272/input_batch_6709248_to_6710272.json
-        let path = format!(
-            "batches/epoch_batch/*_to_{}/input_batch_*_to_{}.json",
-            slot, slot
-        );
-        let glob_pattern = glob::glob(&path)
-            .map_err(|e| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        // Take the first matching file
-        let path = glob_pattern.take(1).next().ok_or_else(|| {
-            Error::IoError(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No matching file found",
-            ))
-        })?;
-
-        let json = fs::read_to_string(path.unwrap()).map_err(Error::IoError)?;
-        serde_json::from_str(&json).map_err(|e| Error::DeserializeError(e.to_string()))
     }
 
     fn proof_type(&self) -> crate::traits::ProofType {
