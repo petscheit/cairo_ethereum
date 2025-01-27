@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use starknet::{core::types::Felt, macros::selector};
 use starknet_crypto::poseidon_hash_many;
+use tracing::info;
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
@@ -32,6 +33,17 @@ impl EpochUpdate {
             circuit_inputs,
             expected_circuit_outputs,
         })
+    }
+}
+
+impl EpochUpdate {
+    pub fn from_json<T>(slot: u64) -> Result<T, Error>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let path = format!("batches/epoch/{}/input_{}.json", slot, slot);
+        let json = fs::read_to_string(path).map_err(Error::IoError)?;
+        serde_json::from_str(&json).map_err(|e| Error::DeserializeError(e.to_string()))
     }
 }
 
@@ -53,15 +65,6 @@ impl Provable for EpochUpdate {
         );
         fs::write(path.clone(), json).map_err(Error::IoError)?;
         Ok(path)
-    }
-
-    fn from_json<T>(slot: u64) -> Result<T, Error>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let path = format!("batches/epoch/{}/input_{}.json", slot, slot);
-        let json = fs::read_to_string(path).map_err(Error::IoError)?;
-        serde_json::from_str(&json).map_err(|e| Error::DeserializeError(e.to_string()))
     }
 
     fn pie_path(&self) -> String {
@@ -174,7 +177,10 @@ impl EpochCircuitInputs {
                         return Err(Error::EmptySlotDetected(slot));
                     }
                     slot += 1;
-                    println!("Empty slot detected! Attempt {}/{}. Fetching slot: {}", attempts, MAX_ATTEMPTS, slot);
+                    info!(
+                        "Empty slot detected! Attempt {}/{}. Fetching slot: {}",
+                        attempts, MAX_ATTEMPTS, slot
+                    );
                 }
                 Err(e) => return Err(e), // Propagate other errors immediately
             }

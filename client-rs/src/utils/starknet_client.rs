@@ -1,3 +1,5 @@
+use alloy_primitives::FixedBytes;
+use serde::{Deserialize, Serialize};
 use starknet::accounts::{Account, ConnectedAccount};
 use starknet::core::types::{Call, FunctionCall};
 use starknet::macros::selector;
@@ -21,6 +23,50 @@ use std::sync::Arc;
 use crate::contract_init::ContractInitializationData;
 use crate::traits::Submittable;
 use crate::BankaiConfig;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EpochProof {
+    pub header_root: FixedBytes<32>,
+    pub state_root: FixedBytes<32>,
+    pub n_signers: u64,
+    pub execution_hash: FixedBytes<32>,
+    pub execution_height: u64,
+}
+
+impl EpochProof {
+    pub fn from_contract_return_value(calldata: Vec<Felt>) -> Result<Self, String> {
+        if calldata.len() != 8 {
+            return Err("Invalid return value length. Expected 8 elements.".to_string());
+        }
+
+        let header_root = combine_to_fixed_bytes(calldata[0], calldata[1])?;
+        let state_root = combine_to_fixed_bytes(calldata[2], calldata[3])?;
+        let n_signers = calldata[4].try_into().unwrap();
+        let execution_hash = combine_to_fixed_bytes(calldata[5], calldata[6])?;
+        let execution_height = calldata[7].try_into().unwrap();
+
+        Ok(EpochProof {
+            header_root,
+            state_root,
+            n_signers,
+            execution_hash,
+            execution_height,
+        })
+    }
+}
+
+fn combine_to_fixed_bytes(high: Felt, low: Felt) -> Result<FixedBytes<32>, String> {
+    let mut bytes = [0u8; 32];
+    let high_bytes = high.to_bytes_le();
+    let low_bytes = low.to_bytes_le();
+
+    bytes[0..16].copy_from_slice(&high_bytes);
+    bytes[16..32].copy_from_slice(&low_bytes);
+
+    Ok(FixedBytes::from_slice(bytes.as_slice()))
+}
+
+#[derive(Debug)]
 pub struct StarknetClient {
     account: Arc<SingleOwnerAccount<JsonRpcClient<HttpTransport>, LocalWallet>>,
     // provider: Arc<JsonRpcClient<HttpTransport>>,
@@ -55,6 +101,7 @@ impl StarknetClient {
         })
     }
 
+    #[cfg(feature = "cli")]
     pub async fn deploy_contract(
         &self,
         init_data: ContractInitializationData,
@@ -93,7 +140,15 @@ impl StarknetClient {
         &self,
         update: impl Submittable<T>,
         config: &BankaiConfig,
-    ) -> Result<(), StarknetError> {
+    ) -> Result<Felt, StarknetError> {
+        println!(
+            "{:?}",
+            vec![Call {
+                to: config.contract_address,
+                selector: update.get_contract_selector(),
+                calldata: update.to_calldata(),
+            }]
+        );
         let result = self
             .account
             .execute_v1(vec![Call {
@@ -106,14 +161,16 @@ impl StarknetClient {
             .map_err(|e| StarknetError::AccountError(e.to_string()))?;
 
         println!("tx_hash: {:?}", result.transaction_hash);
-        Ok(())
+
+        // Return the transaction hash
+        Ok(result.transaction_hash)
     }
 
     pub async fn get_committee_hash(
         &self,
         slot: u64,
         config: &BankaiConfig,
-    ) -> Result<(), StarknetError> {
+    ) -> Result<Vec<Felt>, StarknetError> {
         let committee_id = slot / 0x2000_u64;
         let committee_hash = self
             .account
@@ -129,14 +186,14 @@ impl StarknetClient {
             .await
             .map_err(StarknetError::ProviderError)?;
         println!("committee_hash: {:?}", committee_hash);
-        Ok(())
+        Ok(committee_hash)
     }
 
     pub async fn get_epoch_proof(
         &self,
         slot: u64,
         config: &BankaiConfig,
-    ) -> Result<(), StarknetError> {
+    ) -> Result<EpochProof, StarknetError> {
         let epoch_proof = self
             .account
             .provider()
@@ -151,7 +208,7 @@ impl StarknetClient {
             .await
             .map_err(StarknetError::ProviderError)?;
         println!("epoch_proof: {:?}", epoch_proof);
-        Ok(())
+        Ok(EpochProof::from_contract_return_value(epoch_proof).unwrap())
     }
 
     pub async fn get_latest_epoch_slot(
@@ -180,10 +237,10 @@ impl StarknetClient {
         config: &BankaiConfig,
     ) -> Result<(u64, u64), StarknetError> {
         let latest_epoch_slot = self.get_latest_epoch_slot(config).await?;
-        let next_epoch = (u64::try_from(latest_epoch_slot).unwrap() / 32) * 32 + 32;
-        let term = next_epoch / 0x2000;
-        let terms_last_epoch = (term + 1) * 0x2000 - 32;
-        Ok((next_epoch, terms_last_epoch))
+        let next_epoch_slot = (u64::try_from(latest_epoch_slot).unwrap() / 32) * 32 + 32;
+        let term = next_epoch_slot / 0x2000;
+        let terms_last_epoch_slot = (term + 1) * 0x2000 - 32;
+        Ok((next_epoch_slot, terms_last_epoch_slot))
     }
 
     pub async fn get_latest_committee_id(
